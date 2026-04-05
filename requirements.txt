@@ -1,0 +1,18 @@
+# AI Screen Assistant — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# GUI framework
+customtkinter>=5.2.0
+
+# Screenshot / mouse automation
+pyautogui>=0.9.54
+
+# OCR
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# AI (OpenAI-compatible client pointed at OpenRouter)
+openai>=1.30.0
+
+# Global hotkey listener
+keyboard>=0.13.5
