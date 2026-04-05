@@ -1,4 +1,7 @@
 # ⚡ AI Screen Assistant
+## Preview
+
+![App Screenshot](screenshot.png)
 
 A lightweight Windows desktop tool that captures any region of your screen,
 extracts text with OCR, sends it to **Gemini 2.5 Flash** via
@@ -40,7 +43,7 @@ etc.
 ### 1 — Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-screen-assistant.git
+git clone https://github.com/delniel/ai-screen-assistant.git
 cd ai-screen-assistant
 ```
 
