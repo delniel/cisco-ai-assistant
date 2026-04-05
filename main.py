@@ -1,9 +1,8 @@
 """
 AI Screen Assistant
 ===================
-A desktop tool that screenshots a selected screen region,
-runs OCR and sends the result to Gemini 2.5 Flash via OpenRouter,
-then clicks the correct answer on screen.
+Captures a screen region, OCRs it, asks Gemini via OpenRouter,
+and clicks the correct answer automatically.
 
 Hotkeys (configurable):
     F8              — drag-select capture region
@@ -35,12 +34,11 @@ from PIL import Image
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Tesseract path — override with env var TESSERACT_PATH, or set auto-detect
+# Tesseract: set TESSERACT_PATH env var, or rely on auto-detect / Windows default
 _TESSERACT_ENV = os.environ.get("TESSERACT_PATH", "")
 if _TESSERACT_ENV:
     pytesseract.pytesseract.tesseract_cmd = _TESSERACT_ENV
 elif sys.platform == "win32":
-    # Common Windows default — change if installed elsewhere
     _WIN_DEFAULT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     if os.path.exists(_WIN_DEFAULT):
         pytesseract.pytesseract.tesseract_cmd = _WIN_DEFAULT
@@ -49,8 +47,13 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
-MODEL_ID        = "google/gemini-2.5-flash"
-MODEL_LABEL     = "Gemini 2.5 Flash"
+
+# Available models — exactly two, nothing else
+MODELS = [
+    {"id": "google/gemini-2.5-flash-lite", "label": "Flash Lite  (cheaper)"},
+    {"id": "google/gemini-2.5-flash",      "label": "Flash  (better quality)"},
+]
+DEFAULT_MODEL_ID = MODELS[0]["id"]
 
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".ai_assistant_settings.json")
 
@@ -58,6 +61,11 @@ DEFAULT_HOTKEYS = {
     "select_region": "f8",
     "solve":         "ctrl+shift+s",
 }
+
+SCALE_MIN  = 0.9
+SCALE_MAX  = 1.3
+SCALE_STEP = 0.05
+SCALE_DEFAULT = 1.0
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
 NEON   = "#00ff9c"
@@ -71,81 +79,55 @@ WHITE  = "#ffffff"
 DIM    = "#4a6a5a"
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
-SOLVE_PROMPT = (
-            "You are an expert IT test-solving AI. Answers must be FACTUALLY CORRECT.\n\n"
+SOLVE_PROMPT = """\
+You are an expert IT test-solving AI. Answers must be FACTUALLY CORRECT.
 
-            "TASK:\n"
-            "Analyze screenshot + OCR text. Select correct answer(s) ONLY from given options.\n\n"
+TASK:
+Analyse the screenshot and OCR text. Select correct answer(s) ONLY from the given options.
 
-            "KNOWLEDGE:\n"
-            "Use general IT knowledge (hardware, networking, OS, security).\n\n"
+KNOWLEDGE:
+Use general IT knowledge (hardware, networking, OS, security, certifications).
 
-            "CRITICAL LOGIC:\n"
-            "1. Determine question type:\n"
-            "   - SINGLE → one answer\n"
-            "   - MULTIPLE → multiple answers\n"
-            "   - MATCHING → pairs (left side to right side)\n"
-            "2. If not explicitly multiple → treat as SINGLE.\n\n"
+QUESTION TYPE:
+- SINGLE   → exactly one correct answer
+- MULTIPLE → more than one correct answer (only if explicitly stated)
+- MATCHING → map left-side labels (A, B, C…) to right-side option numbers
 
-            "IMPORTANT FOR MATCHING:\n"
-            "- DO NOT simulate clicks or actions.\n"
-            "- DO NOT try to combine answers.\n"
-            "- ONLY return logical pairs.\n"
-            "- Left side (A, B, C...) must map to RIGHT SIDE OPTION NUMBERS.\n\n"
+RULES:
+1. Choose answers that EXACTLY exist in the options shown.
+2. Use the ORIGINAL option numbers — never renumber.
+3. For SINGLE questions return exactly one answer.
+4. Fix obvious OCR noise using context.
+5. No explanations. No extra text.
 
-            "RULES:\n"
-            "1. ONLY choose answers that EXACTLY exist in the options.\n"
-            "2. You MUST use ORIGINAL option numbers from the screen.\n"
-            "3. NEVER renumber answers.\n"
-            "4. Return EXACT number of answers required.\n"
-            "5. DO NOT invent or modify answers.\n"
-            "6. Ignore OCR noise and fix obvious OCR errors.\n"
-            "7. Use BOTH image and OCR text.\n"
-            "8. Be decisive.\n"
-            "9. If uncertain → choose best answer.\n"
-            "10. NO explanations.\n\n"
+OUTPUT FORMAT:
 
-            "STRICT OUTPUT FORMAT (NO EXTRA TEXT):\n\n"
+SINGLE
+[NUMBER]: [EXACT OPTION TEXT]
 
-            "SINGLE:\n"
-            "[OPTION_NUMBER]: [EXACT OPTION TEXT]\n\n"
+MULTIPLE
+[NUMBER]: [EXACT OPTION TEXT]
+[NUMBER]: [EXACT OPTION TEXT]
 
-            "MULTIPLE:\n"
-            "[OPTION_NUMBER]: [EXACT OPTION TEXT]\n"
-            "[OPTION_NUMBER]: [EXACT OPTION TEXT]\n\n"
+MATCHING
+A-[NUMBER]
+B-[NUMBER]
+C-[NUMBER]
+D-[NUMBER]
+"""
 
-            "MATCHING:\n"
-            "A-[OPTION_NUMBER]\n"
-            "B-[OPTION_NUMBER]\n"
-            "C-[OPTION_NUMBER]\n"
-            "D-[OPTION_NUMBER]\n\n"
-
-            "EXAMPLE MATCHING:\n"
-            "Left side:\n"
-            "A. DDR SDRAM\n"
-            "B. DDR4 SDRAM\n"
-            "C. DDR2 SDRAM\n"
-            "D. DDR3 SDRAM\n\n"
-
-            "Right side:\n"
-            "1. 288 pins\n"
-            "2. 184 pins\n"
-            "3. 240 pins (1.8V)\n"
-            "4. 240 pins (1.5V)\n\n"
-
-            "Correct output:\n"
-            "A-2\n"
-            "B-1\n"
-            "C-3\n"
-            "D-4\n"
-)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SETTINGS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_settings() -> dict:
-    defaults = {"hotkeys": DEFAULT_HOTKEYS.copy(), "api_key": ""}
+    defaults = {
+        "hotkeys":  DEFAULT_HOTKEYS.copy(),
+        "api_key":  "",
+        "model_id": DEFAULT_MODEL_ID,
+        "scale":    SCALE_DEFAULT,
+    }
     if not os.path.exists(SETTINGS_PATH):
         return defaults
     try:
@@ -157,6 +139,8 @@ def load_settings() -> dict:
             elif isinstance(v, dict):
                 for kk, vv in v.items():
                     data[k].setdefault(kk, vv)
+        # Clamp scale in case settings file has an out-of-range value
+        data["scale"] = max(SCALE_MIN, min(SCALE_MAX, float(data["scale"])))
         return data
     except Exception:
         return defaults
@@ -192,15 +176,15 @@ def _similar(a: str, b: str) -> float:
 
 
 _OCR_FIXES = [
-    (r'\bPCle\b',      "PCIe",   re.IGNORECASE),
-    (r'PCl([^a-zA-Z])',r'PCI\1', 0),
-    (r'\bOs\s+simm\b', "SODIMM", re.IGNORECASE),
-    (r'\bO\s+om\b',    "DIMM",   re.IGNORECASE),
-    (r'\bsopimm\b',    "SODIMM", re.IGNORECASE),
-    (r'\bdimn\b',      "DIMM",   re.IGNORECASE),
-    (r'\bdinm\b',      "DIMM",   re.IGNORECASE),
-    (r'\bsodim\b',     "SODIMM", re.IGNORECASE),
-    (r'\bsimn\b',      "SIMM",   re.IGNORECASE),
+    (r'\bPCle\b',       "PCIe",   re.IGNORECASE),
+    (r'PCl([^a-zA-Z])', r'PCI\1', 0),
+    (r'\bOs\s+simm\b',  "SODIMM", re.IGNORECASE),
+    (r'\bO\s+om\b',     "DIMM",   re.IGNORECASE),
+    (r'\bsopimm\b',     "SODIMM", re.IGNORECASE),
+    (r'\bdimn\b',       "DIMM",   re.IGNORECASE),
+    (r'\bdinm\b',       "DIMM",   re.IGNORECASE),
+    (r'\bsodim\b',      "SODIMM", re.IGNORECASE),
+    (r'\bsimn\b',       "SIMM",   re.IGNORECASE),
 ]
 
 def _normalize(text: str) -> str:
@@ -228,8 +212,9 @@ def _cluster_y(values: list[int], gap: int = 12) -> list[int]:
 
 def run_ocr(image: Image.Image, region: tuple) -> tuple[dict, str]:
     """
-    Single OCR pass over *image*.
-    Returns (row_dict, plain_text) — shared between AI call and click engine.
+    Single OCR pass. Returns (row_dict, plain_text).
+    Result is shared between the AI call and the click engine to avoid
+    running Tesseract twice.
     """
     data = pytesseract.image_to_data(
         image, output_type=pytesseract.Output.DICT, lang="eng")
@@ -281,8 +266,8 @@ def _score_row(keys: list[str], row: list[dict]) -> float:
 
 def find_click(target: str, rows: dict, region: tuple) -> tuple:
     """
-    Return (cx, cy, score) for the best-matching row.
-    cx is placed in the left quarter of the row to hit checkboxes/radio buttons.
+    Return (cx, cy, score).
+    cx lands in the left quarter of the matched row to hit radio/checkbox buttons.
     """
     cleaned = re.sub(r'^\d+[:.\s]+', '', target).strip()
     cleaned = re.sub(r'^[A-Za-z]-\s*', '', cleaned).strip()
@@ -330,8 +315,9 @@ def _encode_image(image: Image.Image, max_width: int = 1200) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AIBackend:
-    def __init__(self, api_key: str):
-        self._client = OpenAI(base_url=OPENROUTER_BASE, api_key=api_key.strip())
+    def __init__(self, api_key: str, model_id: str):
+        self._client   = OpenAI(base_url=OPENROUTER_BASE, api_key=api_key.strip())
+        self._model_id = model_id
 
     def ask(self, prompt: str, image: Image.Image, ocr_text: str) -> str:
         full_prompt = f"{prompt}\n\nOCR TEXT FROM SCREEN:\n{ocr_text}"
@@ -342,7 +328,7 @@ class AIBackend:
         ]
         try:
             resp = self._client.chat.completions.create(
-                model=MODEL_ID,
+                model=self._model_id,
                 messages=[{"role": "user", "content": content}],
                 temperature=0.1,
                 max_tokens=256,
@@ -385,31 +371,24 @@ class AnswerOverlay(tk.Toplevel):
         self._job = self.after(self.AUTO_MS, self.close)
         self._tick()
 
-    # ── parsing ───────────────────────────────────────────────────────────────
-
     @staticmethod
     def _parse(raw: str) -> list[dict]:
         result: list[dict] = []
         counter = 1
         for line in (l.strip() for l in raw.splitlines() if l.strip()):
-            # Strip question-type headers
             line = re.sub(
                 r'^(single|multiple|matching)\s*(choice)?\s*:?\s*', '',
                 line, flags=re.I).strip()
             if not line:
                 continue
-            # Matching pair e.g. "A-2"
             m = re.match(r'^([A-Z])-(\d+)$', line)
             if m:
                 result.append({"n": m.group(1), "t": f"→ {m.group(2)}"}); counter += 1; continue
-            # Numbered answer e.g. "3: PCIe"
             m = re.match(r'^(\d+)[:.]\s*(.+)', line)
             if m:
                 result.append({"n": m.group(1), "t": m.group(2).strip()}); counter += 1; continue
             result.append({"n": str(counter), "t": line}); counter += 1
         return result
-
-    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build(self):
         outer = tk.Frame(self, bg=NEON, padx=1, pady=1)
@@ -417,7 +396,6 @@ class AnswerOverlay(tk.Toplevel):
         inner = tk.Frame(outer, bg="#0d0d0f")
         inner.pack(fill="both", expand=True)
 
-        # Title bar
         bar = tk.Frame(inner, bg="#0a1a0f", height=32)
         bar.pack(fill="x"); bar.pack_propagate(False)
         tk.Label(bar, text="⚡ AI ANSWERS", bg="#0a1a0f", fg=NEON,
@@ -431,18 +409,16 @@ class AnswerOverlay(tk.Toplevel):
         close_btn.bind("<Button-1>", lambda _: self.close())
         close_btn.bind("<Enter>",    lambda _: close_btn.configure(bg="#1a0505"))
         close_btn.bind("<Leave>",    lambda _: close_btn.configure(bg="#0a1a0f"))
-        bar.bind("<ButtonPress-1>",  self._drag_start)
-        bar.bind("<B1-Motion>",       self._drag_move)
+        bar.bind("<ButtonPress-1>", self._drag_start)
+        bar.bind("<B1-Motion>",      self._drag_move)
 
         tk.Frame(inner, bg=NEON, height=1).pack(fill="x")
 
-        # Answer cards
         card_area = tk.Frame(inner, bg="#0d0d0f")
         card_area.pack(fill="both", expand=True, padx=12, pady=8)
         for idx, ans in enumerate(self._answers):
             self._card(card_area, ans, idx)
 
-        # Progress bar
         tk.Frame(inner, bg="#111", height=1).pack(fill="x")
         bar_bg = tk.Frame(inner, bg="#111", height=3)
         bar_bg.pack(fill="x"); bar_bg.pack_propagate(False)
@@ -642,13 +618,8 @@ class LogWidget(tk.Frame):
 class HotkeyDialog(ctk.CTkToplevel):
     """
     Modal dialog for remapping hotkeys.
-
-    Opening behind the parent is fixed by deferring grab_set() + focus_force()
-    with .after(80) so the window is fully composited before we call them.
-
-    Ctrl+V inside entries works because:
-      - grab_set() keeps OS-level keyboard focus here while the dialog is open
-      - we bind <<Paste>> explicitly with a clean clipboard_get() fallback
+    Opens on top of parent (deferred grab_set avoids compositor race).
+    Ctrl+V works via explicit <<Paste>> binding inside the grabbed window.
     """
 
     ACTIONS = [
@@ -798,18 +769,24 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("AI Screen Assistant")
-        self.geometry("520x720")
-        self.minsize(480, 580)
+        self.geometry("520x760")
+        self.minsize(480, 600)
         self.attributes("-topmost", True)
 
-        self._settings      = load_settings()
-        self._hotkeys       = self._settings.get("hotkeys", DEFAULT_HOTKEYS.copy())
-        self._hk_queue: queue.Queue = queue.Queue()
-        self.region: tuple | None   = None
+        self._settings = load_settings()
+        self._hotkeys  = self._settings.get("hotkeys", DEFAULT_HOTKEYS.copy())
+
+        # Apply saved scale before building UI
+        self._scale = self._settings.get("scale", SCALE_DEFAULT)
+        ctk.set_widget_scaling(self._scale)
+        ctk.set_window_scaling(self._scale)
+
+        self._hk_queue: queue.Queue        = queue.Queue()
+        self.region: tuple | None          = None
         self._answer_overlay: AnswerOverlay | None = None
-        self._ai: AIBackend | None                 = None
-        self._ai_key_cache: str                    = ""
-        self._spinner: Spinner | None              = None
+        self._ai: AIBackend | None         = None
+        self._ai_cache_key: tuple          = ("", "")   # (api_key, model_id)
+        self._spinner: Spinner | None      = None
 
         self.protocol("WM_DELETE_WINDOW", self._quit)
         self._build_ui()
@@ -832,16 +809,47 @@ class App(ctk.CTk):
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Header
+        # ── Header ───────────────────────────────────────────────────────────
         ctk.CTkLabel(self, text="⚡ AI SCREEN ASSISTANT",
                      font=("Consolas", 22, "bold"), text_color=NEON,
                      ).pack(pady=(16, 2))
-        ctk.CTkLabel(self, text=f"model: {MODEL_LABEL}",
-                     font=("Consolas", 9), text_color=DIM).pack()
 
         self._sep()
 
-        # API key
+        # ── Model selector ────────────────────────────────────────────────────
+        ctk.CTkLabel(self, text="MODEL",
+                     font=("Consolas", 8, "bold"), text_color=DIM,
+                     ).pack(anchor="w", padx=22)
+
+        saved_id = self._settings.get("model_id", DEFAULT_MODEL_ID)
+        # Guard: if saved id is no longer in MODELS list, fall back to default
+        valid_ids = {m["id"] for m in MODELS}
+        if saved_id not in valid_ids:
+            saved_id = DEFAULT_MODEL_ID
+
+        self._model_var = ctk.StringVar(
+            value=next(m["label"] for m in MODELS if m["id"] == saved_id))
+
+        model_labels = [m["label"] for m in MODELS]
+        self._model_menu = ctk.CTkOptionMenu(
+            self,
+            variable=self._model_var,
+            values=model_labels,
+            command=self._on_model_change,
+            width=460, height=34,
+            font=("Consolas", 11),
+            fg_color=BG2,
+            button_color="#1a3a1a",
+            button_hover_color="#2a5a2a",
+            dropdown_fg_color=BG2,
+            dropdown_hover_color="#1a3a1a",
+            dropdown_text_color=WHITE,
+        )
+        self._model_menu.pack(pady=(2, 0), padx=20, fill="x")
+
+        self._sep()
+
+        # ── API key ───────────────────────────────────────────────────────────
         ctk.CTkLabel(self, text="API KEY  (OpenRouter)",
                      font=("Consolas", 8, "bold"), text_color=DIM,
                      ).pack(anchor="w", padx=22)
@@ -854,7 +862,6 @@ class App(ctk.CTk):
             show="*", font=("Consolas", 11), height=36,
             fg_color=BG2, border_color=BORDER, border_width=1)
         self._key_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        # Bind all paste variants — the keyboard lib can swallow raw Ctrl+V
         for seq in ("<Control-v>", "<Control-V>", "<<Paste>>"):
             self._key_entry.bind(seq, self._paste)
         self._key_entry.bind("<KeyRelease>", self._on_key_change)
@@ -869,7 +876,7 @@ class App(ctk.CTk):
 
         self._sep()
 
-        # Action buttons
+        # ── Action buttons + scale controls ───────────────────────────────────
         act = ctk.CTkFrame(self, fg_color="transparent")
         act.pack(fill="x", padx=20, pady=(0, 4))
 
@@ -887,9 +894,29 @@ class App(ctk.CTk):
                       border_color="#1a5a3c", border_width=1,
                       text_color=NEON,
                       command=self._reset_region,
-                      ).pack(side="left")
+                      ).pack(side="left", padx=(0, 8))
 
-        # Hotkey reference card
+        # Scale controls — pushed to the right
+        scale_frame = ctk.CTkFrame(act, fg_color="transparent")
+        scale_frame.pack(side="right")
+
+        self._scale_lbl = ctk.CTkLabel(
+            scale_frame,
+            text=f"{int(self._scale * 100)}%",
+            font=("Consolas", 9), text_color=DIM, width=38)
+        self._scale_lbl.pack(side="left", padx=(0, 4))
+
+        for symbol, delta in [("A−", -SCALE_STEP), ("A+", +SCALE_STEP)]:
+            ctk.CTkButton(scale_frame, text=symbol,
+                          width=36, height=32,
+                          font=("Consolas", 10, "bold"),
+                          fg_color=BG2, hover_color="#1a2a1a",
+                          border_color=BORDER, border_width=1,
+                          text_color=DIM,
+                          command=lambda d=delta: self._change_scale(d),
+                          ).pack(side="left", padx=2)
+
+        # ── Hotkey reference card ─────────────────────────────────────────────
         self._sep()
         ref = ctk.CTkFrame(self, fg_color=BG2, corner_radius=8)
         ref.pack(padx=20, pady=(0, 4), fill="x")
@@ -912,7 +939,7 @@ class App(ctk.CTk):
                          anchor="w").pack(side="left")
             self._hk_pills[key] = pill
 
-        # Status
+        # ── Status ────────────────────────────────────────────────────────────
         self._sep()
         self._status_lbl = ctk.CTkLabel(
             self, text="● Press F8 to select a region",
@@ -920,7 +947,7 @@ class App(ctk.CTk):
         self._status_lbl.pack(pady=(4, 2))
         self._spinner = Spinner(self._status_lbl)
 
-        # Log
+        # ── Log ───────────────────────────────────────────────────────────────
         log_outer = tk.Frame(self, bg=BORDER, bd=1, relief="flat")
         log_outer.pack(padx=18, pady=4, fill="both", expand=True)
 
@@ -942,6 +969,32 @@ class App(ctk.CTk):
     def _sep(self):
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=18, pady=8)
 
+    # ── scaling ───────────────────────────────────────────────────────────────
+
+    def _change_scale(self, delta: float):
+        new = round(self._scale + delta, 2)
+        new = max(SCALE_MIN, min(SCALE_MAX, new))
+        if new == self._scale:
+            return
+        self._scale = new
+        ctk.set_widget_scaling(new)
+        ctk.set_window_scaling(new)
+        self._scale_lbl.configure(text=f"{int(new * 100)}%")
+        self._settings["scale"] = new
+        save_settings(self._settings)
+
+    # ── model ────────────────────────────────────────────────────────────────
+
+    def _on_model_change(self, label: str):
+        model_id = next((m["id"] for m in MODELS if m["label"] == label), DEFAULT_MODEL_ID)
+        self._settings["model_id"] = model_id
+        save_settings(self._settings)
+        self._ai = None   # invalidate cached backend
+
+    def _get_model_id(self) -> str:
+        label = self._model_var.get()
+        return next((m["id"] for m in MODELS if m["label"] == label), DEFAULT_MODEL_ID)
+
     # ── hotkeys ───────────────────────────────────────────────────────────────
 
     def _register_hotkeys(self):
@@ -954,7 +1007,6 @@ class App(ctk.CTk):
             lambda: self._hk_queue.put("solve"))
 
     def _poll_hotkeys(self):
-        """Drain the hotkey queue on the main thread every 50 ms."""
         try:
             while True:
                 action = self._hk_queue.get_nowait()
@@ -1006,11 +1058,14 @@ class App(ctk.CTk):
         key = self._key_entry.get().strip()
         if not key:
             self._set_status("API key is empty", RED); return
-        threading.Thread(target=self._run_solve, args=(key,), daemon=True).start()
+        model_id = self._get_model_id()
+        threading.Thread(
+            target=self._run_solve, args=(key, model_id), daemon=True).start()
 
-    def _run_solve(self, api_key: str):
+    def _run_solve(self, api_key: str, model_id: str):
+        model_label = next((m["label"] for m in MODELS if m["id"] == model_id), model_id)
         self._log_div()
-        self._log("info", f"Model: {MODEL_LABEL}")
+        self._log("info", f"Model: {model_label}")
         self.after(0, self._spinner.start)
         try:
             img           = pyautogui.screenshot(region=self.region)
@@ -1018,7 +1073,7 @@ class App(ctk.CTk):
             if not rows:
                 self._log("warn", "OCR returned nothing — check region")
 
-            answer = self._call_ai(img, ocr_txt, api_key)
+            answer = self._call_ai(img, ocr_txt, api_key, model_id)
             if answer is None:
                 return
 
@@ -1033,10 +1088,12 @@ class App(ctk.CTk):
         finally:
             self.after(0, self._spinner.stop)
 
-    def _call_ai(self, img: Image.Image, ocr_txt: str, api_key: str) -> str | None:
-        if self._ai is None or self._ai_key_cache != api_key:
-            self._ai           = AIBackend(api_key)
-            self._ai_key_cache = api_key
+    def _call_ai(self, img: Image.Image, ocr_txt: str,
+                 api_key: str, model_id: str) -> str | None:
+        cache_key = (api_key, model_id)
+        if self._ai is None or self._ai_cache_key != cache_key:
+            self._ai           = AIBackend(api_key, model_id)
+            self._ai_cache_key = cache_key
 
         raw = self._ai.ask(SOLVE_PROMPT, img, ocr_txt)
 
